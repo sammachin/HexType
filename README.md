@@ -43,12 +43,12 @@ abcdef   ghijkl   mnopqr   stuvwx   yz1234   567890
 
 So tap **12 then 1 → `a`**, tap **7 then 6 → `0`**.
 
-Before you pick a group, all six groups are shown around the **left** pads — each
-sitting on its own pad as two rows of three characters, so you can see which pad
-holds which group. Once you tap a group those disappear and that group's six
-characters appear out on the **right** pads, one per pad, so you can see which pad
-enters which character. Tapping the selected group's pad again deselects it and
-brings the groups back. The text you've typed sits in the middle of the screen,
+All six groups are shown around the **left** pads — each sitting on its own pad as
+two rows of three characters, so you can see which pad holds which group. When you
+tap a group the others dim to grey and the selected one turns yellow (matching its
+LED), and that group's six characters appear out on the **right** pads, one per
+pad, so you can see which pad enters which character. Tapping the selected group's
+pad again deselects it. The text you've typed sits in the middle of the screen,
 with the shift arrow just above it.
 
 ## Shift sets (one-shot)

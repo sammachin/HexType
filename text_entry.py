@@ -116,7 +116,9 @@ def _pad_pos(pad, radius):
 # Colours (0..1 floats).
 _TEXT = (0.95, 0.96, 1.0)
 _HINT = (0.5, 0.55, 0.68)
-_LABEL = (0.66, 0.72, 0.86)   # the group chart on the left
+_LABEL = (0.66, 0.72, 0.86)   # a group in the chart, nothing selected
+_GROUP_SEL = (1.0, 0.82, 0.10)  # the selected group (yellow, matches its LED)
+_GROUP_DIM = (0.5, 0.5, 0.5)  # the other groups once one is selected
 _CHOICE = (0.55, 0.92, 0.66)  # right-pad character choices
 _IND = (0.72, 0.80, 1.0)      # shift arrow
 
@@ -459,10 +461,12 @@ class HexTypeDialog:
         if self._reading:
             self._draw_reading(ctx)
         else:
+            # Always keep every group on screen.  When one is selected the others
+            # dim right down and it turns yellow; its characters also appear on
+            # the right pads.
+            self._draw_group_chart(ctx)
             if self._group is not None and self._group < len(SETS[self._set]):
                 self._draw_choices(ctx)
-            else:
-                self._draw_group_chart(ctx)
             self._draw_entry(ctx)
 
     def _draw_reading(self, ctx):
@@ -481,19 +485,26 @@ class HexTypeDialog:
             ctx.move_to(0, y).text(line)
 
     def _draw_group_chart(self, ctx):
-        """With no group selected, show every group on its own left pad, as two
-        rows of three so it sits neatly over the physical pad."""
+        """Show every group on its own left pad, as two rows of three so it sits
+        neatly over the physical pad.  With nothing selected they're all the same
+        colour; once a group is selected the others dim and it turns yellow."""
         rows = SETS[self._set]
         ctx.text_align = ctx.CENTER
         ctx.text_baseline = ctx.MIDDLE
         ctx.font_size = 15
-        ctx.rgb(*_LABEL)
         for pad in range(7, 13):
             group = _group_of(pad)
             if group >= len(rows):
                 continue
+            if self._group is None:
+                col = _LABEL
+            elif group == self._group:
+                col = _GROUP_SEL
+            else:
+                col = _GROUP_DIM
             row = rows[group]
             x, y = _pad_pos(pad, R_LABEL)
+            ctx.rgb(*col)
             ctx.move_to(x, y - 9).text(row[0:3])
             ctx.move_to(x, y + 9).text(row[3:6])
 

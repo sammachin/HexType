@@ -1,0 +1,27 @@
+[app]
+# The name of your app as displayed in the menu
+name = "HexType"
+
+# The submenu where your app should appear.
+# One of: "Badge", "Music", "Media", "Apps", "Games"
+category = "Apps"
+
+[entry]
+# The name of your entry point `Application` class
+class = "HexTypeApp"
+
+[metadata]
+# Your nickname.  Must be at most 32 characters!
+author = "sammachin"
+
+# License of your app as an SPDX identifier: <https://spdx.org/licenses/>
+license = "MIT"
+
+# URL to the repository of your app.
+url = "https://github.com/sammachin/HexType"
+
+# Description of your app.  Maximum 140 characters!
+description = "Two-tap text entry on the 12 touch pads: tap a left pad to pick a group of six characters, a right pad to enter one. up/dn shifts sets, L/R Backspace/Space"
+
+# Version number of your app.  Must be an integer!
+version = "1"

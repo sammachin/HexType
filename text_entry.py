@@ -366,6 +366,12 @@ class HexTypeDialog:
         self._closed = False
         self._opened_ms = time.ticks_ms()
 
+        # Native TextDialog exposes ``open`` (True while the dialog is up); some
+        # apps read it to decide when to drop the overlay. Provide it so we stay a
+        # drop-in replacement -- we also flip it False on teardown, which native
+        # never does but which can only help a caller that polls it.
+        self.open = True
+
         # Event-driven input, like the firmware's TextDialog: this makes the
         # dialog work whether the caller uses the callback style (add to
         # overlays + on_complete/on_cancel) or awaits run().
@@ -400,11 +406,17 @@ class HexTypeDialog:
         if self._closed:
             return
         self._closed = True
+        self.open = False
         eventbus.remove(ButtonDownEvent, self._handle_down, self.app)
         eventbus.remove(ButtonUpEvent, self._handle_up, self.app)
         if self.use_leds:
             self._leds_off()
             eventbus.emit(PatternEnable())
+
+    # The firmware's TextDialog names its teardown ``_cleanup``, and some apps
+    # (e.g. Bleepie) call it directly on the dialog after completion. Alias it so
+    # we stay a drop-in replacement.
+    _cleanup = _finish
 
     def _complete(self):
         self._finish()

@@ -24,4 +24,4 @@ url = "https://github.com/sammachin/HexType"
 description = "Two-tap text entry on the 12 touch pads: tap a left pad to pick a group of six characters, a right pad to enter one. up/dn shifts sets, L/R Backspace/Space"
 
 # Version number of your app.  Must be an integer!
-version = "1"
+version = "1.1.1"

@@ -25,13 +25,16 @@ Confirm (C) returns the text to the caller.  If the whole string already fits th
 edit screen it returns immediately; if it's longer it first shows a full-screen
 review so you can read it all, and a second Confirm returns it.  Cancel (F) clears
 the text, or -- when it's already empty -- cancels the dialog (returns False).
+
+Matching the native TextDialog: ``on_complete`` / ``on_cancel`` are called with no
+arguments and the handler reads the result off the dialog's ``.text``.
 """
 
 import asyncio
 import math
 import time
 
-from events.input import Buttons, BUTTON_TYPES
+from events.input import BUTTON_TYPES, ButtonDownEvent, ButtonUpEvent
 from app_components.tokens import clear_background
 from system.eventbus import eventbus
 from system.patterndisplay.events import PatternEnable, PatternDisable
@@ -46,38 +49,115 @@ try:
     from tildagonos import tildagonos as _tildagonos
 except Exception:  # pragma: no cover
     _tildagonos = None
+try:
+    import settings as _settings
+except Exception:  # pragma: no cover
+    _settings = None
+
+from .layouts import get_layout, layout_names, DEFAULT_LAYOUT
+
+
+# Persisted-settings keys (stored in the badge's /settings.json).
+SETTING_KEEP_GROUPS = "hextype_keep_groups"
+SETTING_USE_LEDS = "hextype_use_leds"
+SETTING_OVERRIDE = "hextype_override"
+SETTING_LEFT_COLOUR = "hextype_left_colour"
+SETTING_RIGHT_COLOUR = "hextype_right_colour"
+SETTING_LAYOUT = "hextype_layout"
+
+# Selectable colours: name -> (on-screen rgb 0..1, ring-LED rgb 0..255).  The
+# first two match the original yellow/green defaults.
+PALETTE = {
+    "yellow":  ((1.00, 0.82, 0.10), (200, 120, 0)),
+    "green":   ((0.55, 0.92, 0.66), (0, 150, 70)),
+    "cyan":    ((0.40, 0.90, 0.95), (0, 150, 150)),
+    "blue":    ((0.50, 0.68, 1.00), (0, 70, 200)),
+    "magenta": ((1.00, 0.50, 0.90), (170, 0, 130)),
+    "red":     ((1.00, 0.40, 0.40), (190, 0, 0)),
+    "orange":  ((1.00, 0.60, 0.20), (210, 90, 0)),
+    "white":   ((0.92, 0.94, 1.00), (150, 150, 150)),
+}
+PALETTE_NAMES = ["yellow", "green", "cyan", "blue", "magenta", "red", "orange", "white"]
+DEFAULT_LEFT_COLOUR = "yellow"
+DEFAULT_RIGHT_COLOUR = "green"
+
+
+def colour_screen(name):
+    return PALETTE.get(name, PALETTE[DEFAULT_LEFT_COLOUR])[0]
+
+
+def colour_led(name):
+    return PALETTE.get(name, PALETTE[DEFAULT_LEFT_COLOUR])[1]
+
+
+def get_setting(key, default):
+    if _settings is None:
+        return default
+    try:
+        return bool(_settings.get(key, default))
+    except Exception:
+        return default
+
+
+def set_setting(key, value):
+    if _settings is None:
+        return
+    try:
+        _settings.set(key, bool(value))
+        _settings.save()
+    except Exception:
+        pass
+
+
+def get_colour_name(key, default):
+    """A persisted palette name, validated against PALETTE."""
+    if _settings is None:
+        return default
+    try:
+        name = _settings.get(key, default)
+        return name if name in PALETTE else default
+    except Exception:
+        return default
+
+
+def set_colour_name(key, name):
+    if _settings is None:
+        return
+    try:
+        _settings.set(key, name)
+        _settings.save()
+    except Exception:
+        pass
+
+
+def get_layout_name(default=DEFAULT_LAYOUT):
+    """The persisted layout name, validated against the known layouts."""
+    if _settings is None:
+        return default
+    try:
+        name = _settings.get(SETTING_LAYOUT, default)
+        return name if name in layout_names() else default
+    except Exception:
+        return default
+
+
+def set_layout_name(name):
+    if _settings is None:
+        return
+    try:
+        _settings.set(SETTING_LAYOUT, name)
+        _settings.save()
+    except Exception:
+        pass
 
 
 # ----------------------------------------------------------------------------
-# Character sets
+# Character sets: a *layout* provides three sets (standard/upper/symbol) as
+# [standard, upper, symbol] via layouts.py.  Selected per-dialog; index order
+# below matches how the joystick shifts between them.
 # ----------------------------------------------------------------------------
 
-STANDARD = [
-    "abcdef",
-    "ghijkl",
-    "mnopqr",
-    "stuvwx",
-    "yz1234",
-    "567890",
-]
-UPPER = [
-    "ABCDEF",
-    "GHIJKL",
-    "MNOPQR",
-    "STUVWX",
-    "YZ!@£€",
-    "%^&*()",
-]
-SYMBOL = [
-    "§±-_=+",
-    "[]{}<>",
-    "‘“`\\/|",
-    ".,?~;:",
-]
-
-# Index order matters: joystick up/down move away from STD.
 STD, UP, SYM = 0, 1, 2
-SETS = [STANDARD, UPPER, SYMBOL]
 
 
 def _group_of(pad):
@@ -86,15 +166,26 @@ def _group_of(pad):
 def _left_pad_of(group):
     return 12 - group        # inverse, for lighting the selected group's LED
 
-def _col_of(pad):
-    return pad - 1           # right pad 1->col 0 .. 6->col 5
+# Rows shorter than 6 chars are centred on the right pads, keeping them as central
+# as possible: 6->pads1-6, 5->2-6, 4->2-5, 3->3-5, 2->3-4, 1->pad3.
+_CHAR_START_PAD = {6: 1, 5: 2, 4: 2, 3: 3, 2: 3, 1: 3}
+
+
+def _char_start_pad(row_len):
+    return _CHAR_START_PAD.get(row_len, 1)   # 0 or >6 -> 1 (range() handles the rest)
+
+
+def _col_of(pad, row_len):
+    """Right pad -> column index for a row of row_len chars (or None if the pad
+    isn't one of the centred character pads for that length)."""
+    col = pad - _char_start_pad(min(row_len, 6))
+    return col if 0 <= col < row_len else None
 
 MAX_LEN = 200                # cap on the stored text
 
-# Held-backspace auto-repeat: wait this long after the first delete, then delete
-# again every interval while still held.
-_BS_REPEAT_DELAY_MS = 400
-_BS_REPEAT_INTERVAL_MS = 80
+# Ignore Confirm/Cancel for this long after the dialog opens, so a held key that
+# opened it (e.g. selecting a menu item) can't immediately confirm/cancel.
+_OPEN_GUARD_MS = 300
 
 
 # ----------------------------------------------------------------------------
@@ -113,18 +204,15 @@ def _pad_pos(pad, radius):
     return radius * math.sin(ang), -radius * math.cos(ang)
 
 
-# Colours (0..1 floats).
+# Fixed colours (0..1 floats).  The selected-group (left) and character-choice
+# (right) colours are configurable per instance -- see PALETTE / left_colour /
+# right_colour.
 _TEXT = (0.95, 0.96, 1.0)
 _HINT = (0.5, 0.55, 0.68)
 _LABEL = (0.66, 0.72, 0.86)   # a group in the chart, nothing selected
-_GROUP_SEL = (1.0, 0.82, 0.10)  # the selected group (yellow, matches its LED)
 _GROUP_DIM = (0.5, 0.5, 0.5)  # the other groups once one is selected
-_CHOICE = (0.55, 0.92, 0.66)  # right-pad character choices
 _IND = (0.72, 0.80, 1.0)      # shift arrow
 
-# Ring-LED colours (0..255).
-_LED_GROUP = (200, 120, 0)    # the selected group pad (amber)
-_LED_CHAR = (0, 150, 70)      # the six live character pads (green)
 _LED_OFF = (0, 0, 0)
 
 # Edit-screen text layout.  Lines run up to _WRAP_MAX characters, but if there's
@@ -239,73 +327,95 @@ def _reading_lines(ctx, text):
     return result
 
 
-_PENDING = object()   # sentinel: dialog still running
-
-
 class HexTypeDialog:
-    def __init__(self, app, on_complete=None, on_cancel=None, initial=""):
+    def __init__(self, app, on_complete=None, on_cancel=None, initial="",
+                 keep_groups=True, use_leds=True, message="", masked=False,
+                 left_colour=DEFAULT_LEFT_COLOUR, right_colour=DEFAULT_RIGHT_COLOUR,
+                 layout=DEFAULT_LAYOUT):
         self.app = app
         self.on_complete = on_complete
         self.on_cancel = on_cancel
         self.text = initial
+        self.message = message           # prompt shown centred until you type
+        self.masked = masked             # show the text as * (password entry)
 
-        self.buttons = Buttons(app)
+        # The character layout: [standard, upper, symbol] sets.
+        self._sets = get_layout(layout)
+
+        # Switchable options (can be flipped between run()s).
+        self.keep_groups = keep_groups   # keep all groups on screen when selecting
+        self.use_leds = use_leds         # drive the ring LEDs (else leave the OS pattern)
+
+        # Left (selected group) and right (character choices) colours, each used
+        # for both the on-screen highlight and the ring LED.
+        self._left_screen = colour_screen(left_colour)
+        self._left_led = colour_led(left_colour)
+        self._right_screen = colour_screen(right_colour)
+        self._right_led = colour_led(right_colour)
+
         self._group = None       # selected group (row index) or None
         self._set = STD          # active set; one-shot -> reverts after a char
-        self._tap_locked = False  # one tap per finger-contact; needs a release
         self._reading = False    # review screen showing the whole string
         self._read_lines = None  # cached round-screen wrap
-        self._bs_held = False    # backspace auto-repeat state
-        self._bs_timer = 0
+        self._touch = set()      # touch pads currently held down
+        self._tap_locked = False  # one tap per finger-contact; needs a release
 
         self._led_shown = None   # pad -> colour actually on the hardware
-        self._result = _PENDING
+        self._led_warmup = 30 if use_leds else 0  # frames to re-assert LEDs at open
+        self._result = None      # None while running; str on complete, False on cancel
+        self._closed = False
+        self._opened_ms = time.ticks_ms()
+
+        # Event-driven input, like the firmware's TextDialog: this makes the
+        # dialog work whether the caller uses the callback style (add to
+        # overlays + on_complete/on_cancel) or awaits run().
+        eventbus.on(ButtonDownEvent, self._handle_down, app)
+        eventbus.on(ButtonUpEvent, self._handle_up, app)
+
+        # Open: take over the LEDs now (callback-style callers never call run()).
+        if self.use_leds:
+            eventbus.emit(PatternDisable())
+            self._sync_leds()
 
     # ---- lifecycle --------------------------------------------------------
 
     async def run(self, render_update):
-        """Open the dialog and block until the user confirms or cancels.
-        Returns the entered string, or False if cancelled."""
-        # Reset transient state so a reused dialog starts clean (keeps .text).
-        self._result = _PENDING
-        self._reading = False
-        self._read_lines = None
-        self._group = None
-        self._set = STD
-        self._tap_locked = False
-        self._bs_held = False
-        self.buttons.clear()
-
-        eventbus.emit(PatternDisable())
-        self._leds_off()
+        """Async convenience: add ourselves to the overlays and block until the
+        user confirms or cancels.  Returns the string, or False if cancelled.
+        (Callback-style callers skip this and read on_complete/on_cancel.)"""
         self.app.overlays.append(self)
-
-        last = time.ticks_ms()
-        while self._result is _PENDING:
-            now = time.ticks_ms()
-            delta = time.ticks_diff(now, last)
-            last = now
-            self._update(delta)
-            self._sync_leds()
+        await render_update()
+        while self._result is None:
             await render_update()
             await asyncio.sleep(0.02)
-
         try:
             self.app.overlays.remove(self)
         except ValueError:
             pass
-        self._leds_off()
-        eventbus.emit(PatternEnable())
-        self.buttons.clear()
         await render_update()
         return self._result
 
+    def _finish(self):
+        """Idempotent teardown: unsubscribe and hand the LEDs back."""
+        if self._closed:
+            return
+        self._closed = True
+        eventbus.remove(ButtonDownEvent, self._handle_down, self.app)
+        eventbus.remove(ButtonUpEvent, self._handle_up, self.app)
+        if self.use_leds:
+            self._leds_off()
+            eventbus.emit(PatternEnable())
+
     def _complete(self):
+        self._finish()
         self._result = self.text
+        # Match the native TextDialog contract: handlers take NO args and read
+        # the text off the dialog (.text) themselves.
         if self.on_complete is not None:
-            self.on_complete(self.text)
+            self.on_complete()
 
     def _cancel(self):
+        self._finish()
         self._result = False
         if self.on_cancel is not None:
             self.on_cancel()
@@ -321,13 +431,16 @@ class HexTypeDialog:
         self._led_shown = {}
 
     def _sync_leds(self):
-        """Light the selected group pad and the six character pads."""
+        """Light the selected group pad and its (centred) character pads."""
         state = {}
         if self._group is not None:
-            state[_left_pad_of(self._group)] = _LED_GROUP
-            if self._group < len(SETS[self._set]):
-                for pad in range(1, 7):
-                    state[pad] = _LED_CHAR
+            state[_left_pad_of(self._group)] = self._left_led
+            rows = self._sets[self._set]
+            if self._group < len(rows):
+                row = rows[self._group]
+                start = _char_start_pad(min(len(row), 6))
+                for col in range(min(len(row), 6)):
+                    state[start + col] = self._right_led
         if _tildagonos is None or state == self._led_shown:
             return
         for i in range(1, 13):
@@ -335,74 +448,98 @@ class HexTypeDialog:
         _tildagonos.leds.write()
         self._led_shown = dict(state)
 
-    # ---- input ------------------------------------------------------------
+    # ---- input (event-driven) ---------------------------------------------
 
-    def _pressed(self):
-        if _FB is None:
-            return set()
-        states = _FB.touch_states
-        return {n for n in range(1, 13) if states["TOUCH%02d" % n][0]}
+    def _handle_down(self, event):
+        if self._result is not None:
+            return                          # already finished
+        b = event.button
+        name = getattr(b, "name", "") or ""
 
-    def _update(self, delta):
-        b = self.buttons
+        # A held key that opened the dialog keeps re-emitting; ignore Confirm/
+        # Cancel until the open guard passes so it can't act on that key.
+        guarded = time.ticks_diff(time.ticks_ms(), self._opened_ms) < _OPEN_GUARD_MS
 
-        # F: leave review -> back to editing; else clear the text; else cancel.
-        if b.pressed(BUTTON_TYPES["CANCEL"]):
-            if self._reading:
-                self._reading = False
-            elif self.text:
-                self.text = ""
-                self._group = None
-                self._set = STD
-                self._read_lines = None
-            else:
-                self._cancel()
-            return
-
-        # C: return the text.  If the whole thing already fits the edit screen,
-        # return straight away; otherwise show the review first, then a second C
-        # returns it.
-        if b.pressed(BUTTON_TYPES["CONFIRM"]):
-            if self._reading:
-                self._complete()
-            elif len(_wrap(self.text)) <= _MAX_LINES:
-                self._complete()
-            else:
-                self._reading = True
-                self._read_lines = None
-            return
-
-        if self._reading:
-            self._bs_held = False
-            return
-
-        # Backspace (LEFT) auto-repeats while held.
-        self._update_backspace(delta)
-
-        # Joystick edits that don't need a group.
-        if b.pressed(BUTTON_TYPES["RIGHT"]):       # space
+        if name.startswith("TOUCH"):        # touch pads: TOUCH01..TOUCH12
+            try:
+                pad = int(name[5:])
+            except ValueError:
+                pad = 0
+            if pad:
+                self._touch_down(pad)
+        elif BUTTON_TYPES["CANCEL"] in b:
+            if not guarded:
+                self._on_cancel()
+        elif BUTTON_TYPES["CONFIRM"] in b:
+            if not guarded:
+                self._on_confirm()
+        elif self._reading:
+            pass                            # review screen ignores editing keys
+        elif BUTTON_TYPES["LEFT"] in b:     # backspace (repeats via re-emit)
+            self.text = self.text[:-1]
+        elif BUTTON_TYPES["RIGHT"] in b:    # space
             self._append(" ")
-        if b.pressed(BUTTON_TYPES["UP"]):          # one-shot upper (toggle)
+        elif BUTTON_TYPES["UP"] in b:       # one-shot upper (toggle)
             self._set = STD if self._set == UP else UP
-        if b.pressed(BUTTON_TYPES["DOWN"]):        # one-shot symbols (toggle)
+            self._drop_stranded_group()
+        elif BUTTON_TYPES["DOWN"] in b:     # one-shot symbols (toggle)
             self._set = STD if self._set == SYM else SYM
+            self._drop_stranded_group()
+
+        # Re-light after a state change, but not once we've finished (a
+        # complete/cancel already handed the LEDs back).
+        if self.use_leds and self._result is None:
+            self._sync_leds()
+
+    def _handle_up(self, event):
+        name = getattr(event.button, "name", "") or ""
+        if name.startswith("TOUCH"):
+            try:
+                pad = int(name[5:])
+            except ValueError:
+                return
+            self._touch.discard(pad)
+            if not self._touch:
+                self._tap_locked = False
+
+    def _on_cancel(self):
+        # F: leave review -> back to editing; else clear the text; else cancel.
+        if self._reading:
+            self._reading = False
+        elif self.text:
+            self.text = ""
+            self._group = None
+            self._set = STD
+            self._read_lines = None
+        else:
+            self._cancel()
+
+    def _on_confirm(self):
+        # C: return the text.  Whole thing already visible (or masked) -> return
+        # now; otherwise show the review first, then a second C returns it.
+        if self._reading:
+            self._complete()
+        elif self.masked or len(_wrap(self.text)) <= _MAX_LINES:
+            self._complete()
+        else:
+            self._reading = True
+            self._read_lines = None
+
+    def _drop_stranded_group(self):
         # A shift to a smaller set can strand the selected group; drop it.
-        if self._group is not None and self._group >= len(SETS[self._set]):
+        if self._group is not None and self._group >= len(self._sets[self._set]):
             self._group = None
 
-        self._update_taps()
-
-    def _update_taps(self):
-        pressed = self._pressed()
-        if not pressed:
-            self._tap_locked = False
+    def _touch_down(self, pad):
+        if self._reading:
             return
+        self._touch.add(pad)
         if self._tap_locked:
             return
         # First contact of a fresh tap: accept exactly one pad, then wait for a
         # full release before the next.  This kills adjacent-pad bleed doubles.
         self._tap_locked = True
-        self._handle_tap(self._pick_tap(pressed))
+        self._handle_tap(self._pick_tap(self._touch))
 
     def _pick_tap(self, pressed):
         """Pick the one intended pad, biased to the side we expect next."""
@@ -418,60 +555,66 @@ class HexTypeDialog:
             group = _group_of(pad)
             if group == self._group:
                 self._group = None       # re-tapping the selected group deselects
-            elif group < len(SETS[self._set]):
+            elif group < len(self._sets[self._set]):
                 self._group = group
             # taps on an empty group slot (symbol set) are ignored
         elif 1 <= pad <= 6:
             if self._group is None:
                 return
-            rows = SETS[self._set]
+            rows = self._sets[self._set]
             if self._group >= len(rows):
                 return
             row = rows[self._group]
-            col = _col_of(pad)
-            if col < len(row):
+            col = _col_of(pad, len(row))
+            if col is not None:
                 self._append(row[col])
                 # reset-each-char + one-shot shift both revert here
                 self._group = None
                 self._set = STD
 
-    def _update_backspace(self, delta):
-        """Delete once on press, then repeat while LEFT is held down."""
-        if self.buttons.get(BUTTON_TYPES["LEFT"]):
-            if not self._bs_held:
-                self._bs_held = True
-                self._bs_timer = _BS_REPEAT_DELAY_MS
-                self.text = self.text[:-1]
-            else:
-                self._bs_timer -= delta
-                if self._bs_timer <= 0:
-                    self._bs_timer = _BS_REPEAT_INTERVAL_MS
-                    self.text = self.text[:-1]
-        else:
-            self._bs_held = False
-
     def _append(self, ch):
         if len(self.text) < MAX_LEN:
             self.text += ch
+
+    def _shown(self, text):
+        """The text as displayed -- masked to * for password entry."""
+        return ("*" * len(text)) if self.masked else text
 
     # ---- drawing (as a full-screen overlay) -------------------------------
 
     def draw(self, ctx):
         clear_background(ctx)   # opaque: cover the host app underneath
+
+        # PatternDisable is handled asynchronously, so the OS pattern keeps
+        # writing the LEDs for a few frames after we open -- long enough to leave
+        # a stale frame behind.  Re-assert our LED state every frame for a short
+        # warm-up so it wins once the pattern actually stops.
+        if self.use_leds and self._led_warmup > 0:
+            self._led_warmup -= 1
+            self._led_shown = None      # force the write past the throttle
+            self._sync_leds()
+
         if self._reading:
             self._draw_reading(ctx)
         else:
-            # Always keep every group on screen.  When one is selected the others
-            # dim right down and it turns yellow; its characters also appear on
-            # the right pads.
-            self._draw_group_chart(ctx)
-            if self._group is not None and self._group < len(SETS[self._set]):
-                self._draw_choices(ctx)
+            selected = self._group is not None and self._group < len(self._sets[self._set])
+            if self.keep_groups:
+                # Keep every group on screen: the others dim and the selected one
+                # turns yellow, with its characters also out on the right pads.
+                self._draw_group_chart(ctx)
+                if selected:
+                    self._draw_choices(ctx)
+            else:
+                # Swap the group chart out for the selected group's characters.
+                if selected:
+                    self._draw_choices(ctx)
+                else:
+                    self._draw_group_chart(ctx)
             self._draw_entry(ctx)
 
     def _draw_reading(self, ctx):
         if self._read_lines is None:
-            self._read_lines = _reading_lines(ctx, self.text)
+            self._read_lines = _reading_lines(ctx, self._shown(self.text))
         ctx.text_align = ctx.CENTER
         ctx.text_baseline = ctx.MIDDLE
         lines = self._read_lines
@@ -488,7 +631,7 @@ class HexTypeDialog:
         """Show every group on its own left pad, as two rows of three so it sits
         neatly over the physical pad.  With nothing selected they're all the same
         colour; once a group is selected the others dim and it turns yellow."""
-        rows = SETS[self._set]
+        rows = self._sets[self._set]
         ctx.text_align = ctx.CENTER
         ctx.text_baseline = ctx.MIDDLE
         ctx.font_size = 15
@@ -499,7 +642,7 @@ class HexTypeDialog:
             if self._group is None:
                 col = _LABEL
             elif group == self._group:
-                col = _GROUP_SEL
+                col = self._left_screen
             else:
                 col = _GROUP_DIM
             row = rows[group]
@@ -509,16 +652,15 @@ class HexTypeDialog:
             ctx.move_to(x, y + 9).text(row[3:6])
 
     def _draw_choices(self, ctx):
-        """With a group selected, show its six characters out on the right pads."""
-        row = SETS[self._set][self._group]
+        """With a group selected, show its characters on the (centred) right pads."""
+        row = self._sets[self._set][self._group]
         ctx.text_align = ctx.CENTER
         ctx.text_baseline = ctx.MIDDLE
         ctx.font_size = 24
-        for pad in range(1, 7):
-            col = _col_of(pad)
-            if col < len(row):
-                x, y = _pad_pos(pad, R_LABEL)
-                ctx.rgb(*_CHOICE).move_to(x, y).text(row[col])
+        start = _char_start_pad(min(len(row), 6))
+        for col in range(min(len(row), 6)):
+            x, y = _pad_pos(start + col, R_LABEL)
+            ctx.rgb(*self._right_screen).move_to(x, y).text(row[col])
 
     def _draw_entry(self, ctx):
         """The typed text in the middle, with the shift arrow above it."""
@@ -530,12 +672,113 @@ class HexTypeDialog:
             ctx.rgb(*_IND).move_to(0, -52).text("↑" if self._set == UP else "↓")
 
         if not self.text:
+            # Empty: show the prompt (or a generic hint) as centred placeholder.
             ctx.font_size = 18
-            ctx.rgb(*_HINT).move_to(0, 10).text("type…")
+            ctx.rgb(*_HINT)
+            plines = _wrap(self.message or "type…")[:_MAX_LINES]
+            y0 = 10 - (len(plines) - 1) * _LINE_H / 2
+            for i, line in enumerate(plines):
+                ctx.move_to(0, y0 + i * _LINE_H).text(line)
             return
-        lines = _wrap(self.text + "|")[-_MAX_LINES:]
+        lines = _wrap(self._shown(self.text) + "|")[-_MAX_LINES:]
         ctx.font_size = 20
         ctx.rgb(*_TEXT)
         y0 = 10 - (len(lines) - 1) * _LINE_H / 2
         for i, line in enumerate(lines):
             ctx.move_to(0, y0 + i * _LINE_H).text(line)
+
+
+# ----------------------------------------------------------------------------
+# Drop-in replacement for the firmware's app_components.TextDialog
+# ----------------------------------------------------------------------------
+
+class HexTextDialog(HexTypeDialog):
+    """Same constructor/return contract as the firmware's ``TextDialog`` --
+    ``TextDialog(message, app, masked=False, on_complete=None, on_cancel=None)``,
+    ``await run(render_update)`` returns the string (or ``False`` if cancelled) --
+    but backed by the HexType touch-pad method.  Honours the persisted HexType
+    options so it behaves consistently wherever it's used."""
+
+    def __init__(self, message, app, masked=False, on_complete=None, on_cancel=None):
+        super().__init__(
+            app,
+            on_complete=on_complete,
+            on_cancel=on_cancel,
+            initial="",
+            keep_groups=get_setting(SETTING_KEEP_GROUPS, True),
+            use_leds=get_setting(SETTING_USE_LEDS, True),
+            message=message,
+            masked=masked,
+            left_colour=get_colour_name(SETTING_LEFT_COLOUR, DEFAULT_LEFT_COLOUR),
+            right_colour=get_colour_name(SETTING_RIGHT_COLOUR, DEFAULT_RIGHT_COLOUR),
+            layout=get_layout_name(),
+        )
+
+
+# System-wide override of app_components.TextDialog.  Best effort: it patches the
+# package attribute *and* rebinds the name in every already-imported module (so
+# apps that did `from app_components import TextDialog` before us are covered
+# too).  It does NOT survive a reboot -- no user-app code runs at boot -- so it's
+# re-applied whenever this app loads with the setting on; and it doesn't provide
+# the physical-keyboard path the native dialog has.
+_orig_textdialog = None
+
+
+def _rebind_textdialog(old, new):
+    """Point every module-level `TextDialog` that is `old` at `new`."""
+    import sys
+    # Snapshot the values: a getattr below could import a submodule and mutate
+    # sys.modules, which would break a live iteration.
+    for mod in list(sys.modules.values()):
+        try:
+            if getattr(mod, "TextDialog", None) is old:
+                mod.TextDialog = new
+        except Exception:
+            pass
+
+
+def install_override():
+    """Replace app_components.TextDialog with HexTextDialog everywhere."""
+    global _orig_textdialog
+    try:
+        import app_components
+        import app_components.dialog as _dialog
+    except Exception:
+        return False
+    if _orig_textdialog is None:
+        _orig_textdialog = _dialog.TextDialog
+    _rebind_textdialog(_orig_textdialog, HexTextDialog)
+    _dialog.TextDialog = HexTextDialog
+    app_components.TextDialog = HexTextDialog
+    return True
+
+
+def remove_override():
+    """Restore the firmware's TextDialog."""
+    global _orig_textdialog
+    if _orig_textdialog is None:
+        return
+    try:
+        import app_components
+        import app_components.dialog as _dialog
+    except Exception:
+        return
+    _rebind_textdialog(HexTextDialog, _orig_textdialog)
+    _dialog.TextDialog = _orig_textdialog
+    app_components.TextDialog = _orig_textdialog
+
+
+def is_overridden():
+    try:
+        import app_components.dialog as _dialog
+        return _dialog.TextDialog is HexTextDialog
+    except Exception:
+        return False
+
+
+def apply_override_setting():
+    """Install or remove the override to match the persisted setting."""
+    if get_setting(SETTING_OVERRIDE, False):
+        install_override()
+    else:
+        remove_override()
